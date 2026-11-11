@@ -79,7 +79,10 @@ fn bump_position(ch: char, line: &mut u32, col: &mut u32) {
         *line += 1;
         *col = 0;
     } else {
-        *col += 1;
+        // Columns are UTF-8 byte offsets within the row (SDK contract), not
+        // char counts: `"é"` advances two columns (#5). CR in CRLF is an
+        // ordinary byte at the end of its row.
+        *col += ch.len_utf8() as u32;
     }
 }
 
@@ -338,6 +341,28 @@ fn atom_node(id: &str, token: &Token, node_type: &str) -> SemanticNode {
     .build()
 }
 
+/// Node type for a non-head atom inside a structured form. `func` keeps its
+/// historical vocabulary (bare atoms are body instructions); other forms treat
+/// numeric atoms (limits, offsets) as literals and the rest (value types,
+/// keywords such as `funcref`/`shared`) as keyword atoms.
+fn atom_node_type(form_type: &str, text: &str) -> &'static str {
+    if text.starts_with('$') {
+        "identifier"
+    } else if text.starts_with('"') {
+        "literal"
+    } else if form_type == "func" {
+        "instruction"
+    } else if text
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit() || c == '-' || c == '+')
+    {
+        "literal"
+    } else {
+        "keyword"
+    }
+}
+
 fn instruction_label(form: &Form) -> String {
     let mut parts = Vec::new();
     for item in &form.items {
@@ -379,14 +404,15 @@ fn build_form(form: &Form, id: &str, parent_module: Option<&str>) -> SemanticNod
                     seen_head = true;
                     continue;
                 }
-                if mapped == "func" {
-                    let node_type = if token.text.starts_with('$') {
-                        "identifier"
-                    } else if token.text.starts_with('"') {
-                        "literal"
-                    } else {
-                        "instruction"
-                    };
+                // Every non-head atom of a structured form is a source fact:
+                // memory/table limits, import module AND field names, global
+                // value types, start targets, etc. Only `func` used to keep them,
+                // so e.g. `(import "env" "first" ...)` -> `"second"` or
+                // `(memory 1 2)` -> `(memory 1 3)` vanished from the tree and
+                // diffed as style-only (#4). Instruction and signature forms
+                // already carry every atom in their label.
+                if !matches!(mapped, "instruction" | "signature") {
+                    let node_type = atom_node_type(mapped, &token.text);
                     children.push(atom_node(
                         &format!("{}.{}", id, child_index),
                         token,
@@ -423,6 +449,18 @@ fn build_form(form: &Form, id: &str, parent_module: Option<&str>) -> SemanticNod
     builder.build()
 }
 
+/// Zero-based (row, UTF-8 byte column) of the end of `source` over
+/// LF-separated rows.
+fn eof_position(source: &str) -> (u32, u32) {
+    match source.rfind('\n') {
+        Some(idx) => (
+            source.matches('\n').count() as u32,
+            (source.len() - idx - 1) as u32,
+        ),
+        None => (0, source.len() as u32),
+    }
+}
+
 fn process_impl(source: &str) -> String {
     let tokens = tokenize(source);
     let forms = parse_forms(&tokens);
@@ -434,10 +472,22 @@ fn process_impl(source: &str) -> String {
             .enumerate()
             .map(|(index, form)| build_form(form, &format!("0.{}", index), None))
             .collect();
-        let end_line = source.lines().count() as u32;
-        SemanticNodeBuilder::new("0", "source_file", "source_file", 1, 0, end_line, 0, "")
-            .children(children)
-            .build()
+        // Zero-based wrapper spanning the whole source up to exact EOF (#5):
+        // the old wrapper started at row 1 and ended at `lines().count()`,
+        // which is out of bounds for single-line input like `(func)`.
+        let (end_line, end_col) = eof_position(source);
+        SemanticNodeBuilder::new(
+            "0",
+            "source_file",
+            "source_file",
+            0,
+            0,
+            end_line,
+            end_col,
+            "",
+        )
+        .children(children)
+        .build()
     };
     serde_json::to_string(&sem).unwrap_or_else(|e| format!(r#"{{"error":"Serialisation: {}"}}"#, e))
 }
@@ -559,5 +609,166 @@ mod tests {
             "expected added function: {}",
             out
         );
+    }
+    fn tree(source: &str) -> serde_json::Value {
+        let out = process_impl(source);
+        t::assert_valid_json(&out, source);
+        t::assert_no_error(&out, source);
+        serde_json::from_str(&out).unwrap()
+    }
+
+    /// Position-free projection (type, label, children) used to compare the
+    /// semantic content of two trees.
+    fn shape(node: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "t": node["node_type"],
+            "l": node["label"],
+            "c": node["children"].as_array().unwrap().iter().map(shape).collect::<Vec<_>>(),
+        })
+    }
+
+    fn find<'a>(
+        node: &'a serde_json::Value,
+        node_type: &str,
+        label: &str,
+    ) -> Option<&'a serde_json::Value> {
+        if node["node_type"] == node_type && node["label"] == label {
+            return Some(node);
+        }
+        node["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|c| find(c, node_type, label))
+    }
+
+    fn span(node: &serde_json::Value) -> (u64, u64, u64, u64) {
+        let p = &node["position"];
+        (
+            p["start_line"].as_u64().unwrap(),
+            p["start_col"].as_u64().unwrap(),
+            p["end_line"].as_u64().unwrap(),
+            p["end_col"].as_u64().unwrap(),
+        )
+    }
+
+    fn assert_changed(
+        old: &str,
+        new: &str,
+        node_type: &str,
+        label: &str,
+        at: (u64, u64, u64, u64),
+    ) {
+        let (a, b) = (tree(old), tree(new));
+        assert_ne!(shape(&a), shape(&b), "{old:?} -> {new:?} must differ");
+        let leaf = find(&b, node_type, label)
+            .unwrap_or_else(|| panic!("{node_type} {label} missing in {b}"));
+        assert_eq!(span(leaf), at, "span of {label} in {new:?}");
+    }
+
+    // #4: non-func forms dropped every non-label atom.
+    #[test]
+    fn import_field_name_is_preserved() {
+        assert_changed(
+            "(module (import \"env\" \"first\" (func $f)))\n",
+            "(module (import \"env\" \"second\" (func $f)))\n",
+            "literal",
+            "\"second\"",
+            (0, 22, 0, 30),
+        );
+        assert_changed(
+            "(module (import \"env\" \"safe\" (func)))\n",
+            "(module (import \"env\" \"danger\" (func)))\n",
+            "literal",
+            "\"danger\"",
+            (0, 22, 0, 30),
+        );
+        // Multi-line form and an import module rename.
+        assert_changed(
+            "(module\n  (import\n    \"env\"\n    \"f\"\n    (func $f)))\n",
+            "(module\n  (import\n    \"host\"\n    \"f\"\n    (func $f)))\n",
+            "literal",
+            "\"host\"",
+            (2, 4, 2, 10),
+        );
+    }
+
+    #[test]
+    fn memory_limits_are_preserved() {
+        assert_changed(
+            "(module (memory 1 2))\n",
+            "(module (memory 1 3))\n",
+            "literal",
+            "3",
+            (0, 18, 0, 19),
+        );
+        assert_changed(
+            "(module (memory (export \"memory\") 1 2))\n",
+            "(module (memory (export \"memory\") 2 2))\n",
+            "literal",
+            "2",
+            (0, 34, 0, 35),
+        );
+    }
+
+    #[test]
+    fn imported_global_type_is_preserved() {
+        assert_changed(
+            "(module (import \"env\" \"g\" (global $g i32)))\n",
+            "(module (import \"env\" \"g\" (global $g i64)))\n",
+            "keyword",
+            "i64",
+            (0, 37, 0, 40),
+        );
+    }
+
+    #[test]
+    fn layout_and_comments_stay_insignificant() {
+        let base = "(module (import \"env\" \"f\" (func $f)) (memory 1 2))\n";
+        let variants = [
+            "(module\n  (import \"env\" \"f\" (func $f))\n  (memory 1 2))",
+            ";; header\n(module (import \"env\" \"f\" (func $f)) (; mid ;) (memory 1 2))\n",
+            "(module (import \"env\" \"f\" (func $f)) (memory 1 2)) ;; \"q\" ( )\n",
+        ];
+        for v in variants {
+            assert_eq!(shape(&tree(base)), shape(&tree(v)), "{v:?}");
+        }
+        // Delimiters inside a quoted field stay inside one atom.
+        let quoted = tree("(module (import \"env\" \"a;;(b)\" (func)))");
+        assert!(find(&quoted, "literal", "\"a;;(b)\"").is_some(), "{quoted}");
+    }
+
+    // #5: zero-based wrapper with exact EOF; UTF-8 byte columns.
+    #[test]
+    fn wrapper_span_is_zero_based_and_exact() {
+        assert_eq!(span(&tree("(func)")), (0, 0, 0, 6));
+        assert_eq!(span(&tree("(func)\n")), (0, 0, 1, 0));
+        assert_eq!(span(&tree("")), (0, 0, 0, 0));
+        let two = tree("(module)\n(assert_return (invoke \"é\"))");
+        assert_eq!(two["node_type"], "source_file");
+        assert_eq!(span(&two), (0, 0, 1, 29));
+        let ids: Vec<_> = two["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, ["0.0", "0.1"]);
+    }
+
+    #[test]
+    fn columns_are_utf8_bytes() {
+        let src = "(module (func (export \"é\") (result i32) i32.const 1))";
+        assert_eq!(src.len(), 54);
+        let root = tree(src);
+        assert_eq!(span(&root), (0, 0, 0, 54));
+        let export = find(&root, "export", "\"é\"").unwrap();
+        assert_eq!(span(export), (0, 14, 0, 27));
+        let konst = find(&root, "instruction", "1").unwrap();
+        assert_eq!(span(konst), (0, 51, 0, 52));
+        // Multibyte indentation-adjacent content on a later row.
+        let multi = tree("(module\n  (data (i32.const 0) \"雪\") (memory 1))");
+        let mem = find(&multi, "literal", "1").unwrap();
+        assert_eq!(span(mem), (1, 37, 1, 38));
     }
 }
